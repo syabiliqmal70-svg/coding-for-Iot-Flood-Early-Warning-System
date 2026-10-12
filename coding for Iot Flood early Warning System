@@ -1,0 +1,251 @@
+// =============================================================
+// 1. Tetapan Blynk (Template ID, Name & Auth Token)
+// =============================================================
+#define BLYNK_TEMPLATE_ID   "TMPL6G2KGujqU"
+#define BLYNK_TEMPLATE_NAME "Iot Flood Early Warning System"
+#define BLYNK_AUTH_TOKEN    "ExxeCR3614PWTPLXwfi-yiApaoIoQW55"
+
+#define BLYNK_PRINT Serial
+
+#include <WiFi.h>
+#include <WiFiClient.h>
+#include <BlynkSimpleEsp32.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+
+// Maklumat WiFi
+char ssid[] = "Yuda";
+char pass[] = "joyzy296";
+
+// =============================================================
+// 2. Pemetaan Pin ESP32 (Berdasarkan Jadual Pinout Penyambungan)
+// =============================================================
+#define TRIG_PIN      5    // Ultrasonic TRIG
+#define ECHO_PIN      18   // Ultrasonic ECHO
+#define RAIN_PIN      34   // Rain Sensor Analog Out (AO)
+#define FLOW_PIN      27   // Water Flow Sensor Signal
+
+#define LED_GREEN     12   // LED Status Hijau (SAFE)
+#define LED_YELLOW    14   // LED Status Kuning (ALERT)
+#define LED_RED       13   // LED Status Merah (EMERGENCY) - Digunakan GPIO 13
+#define BUZZER_PIN    25   // Buzzer Signal
+
+// Tetapan Logik Buzzer (Active HIGH)
+#define BUZZER_ON     LOW 
+#define BUZZER_OFF    HIGH 
+
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+BlynkTimer timer;
+
+// Pembolehubah Sensor Flow
+volatile unsigned long pulseCount = 0;
+float flowRate = 0.0;
+unsigned long oldTime = 0;
+
+// Pembolehubah Ultrasonic & Rain
+long duration;
+float distance;
+float waterLevel; 
+const float MAX_DEPTH = 7.5;          // Kedalaman bekas (7.5 cm)
+const float OFFSET_CORRECTION = 1.2;  // Offset pelarasan (1.2 cm)
+
+int rainVal = 0;
+bool isRaining = false;
+String statusStr = "SAFE";
+
+// Pembolehubah Kawalan Notifikasi & Buzzer
+unsigned long lastNotifTime = 0;
+bool buzzerState = false;
+
+// Interrupt Service Routine untuk Flow Sensor
+void IRAM_ATTR pulseCounter() {
+  pulseCount++;
+}
+
+// =============================================================
+// 3. Pemprosesan Data Sensor & Logik Amaran (Setiap 0.5s)
+// =============================================================
+void processSensorData() {
+  unsigned long currentMillis = millis();
+  unsigned long timeElapsed = currentMillis - oldTime;
+
+  // --- 1. Pengiraan Water Flow Sensor (GPIO 27) ---
+  if (timeElapsed >= 500) {
+    noInterrupts();
+    unsigned long count = pulseCount;
+    pulseCount = 0;
+    interrupts();
+
+    flowRate = ((1000.0 / timeElapsed) * count) / 7.5; 
+    oldTime = currentMillis;
+  }
+
+  // --- 2. Bacaan Sensor Hujan (GPIO 34) ---
+  rainVal = analogRead(RAIN_PIN);
+  if (rainVal < 3000) {      
+    isRaining = true;       // BASAH
+  } else {
+    isRaining = false;      // KERING
+  }
+
+  // --- 3. Bacaan Ultrasonic Sensor (GPIO 5 & GPIO 18) ---
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+
+  duration = pulseIn(ECHO_PIN, HIGH, 26000); 
+
+  if (duration == 0) {
+    distance = MAX_DEPTH;
+  } else {
+    distance = duration * 0.034 / 2.0;
+  }
+
+  if (distance < 0) distance = 0;
+  if (distance > MAX_DEPTH) distance = MAX_DEPTH;
+
+  // Kira Paras Air Sebenar
+  waterLevel = (MAX_DEPTH - distance) - OFFSET_CORRECTION;
+  if (waterLevel < 0.0) waterLevel = 0.0;
+
+  // =======================================================
+  // KAWALAN UTAMA LED & BUZZER 
+  // =======================================================
+  
+  // 1. EMERGENCY: Paras Air >= 3.0 cm
+  if (waterLevel >= 3.0) {
+    statusStr = "EMERGENCY";
+    digitalWrite(LED_GREEN, LOW);    // Hijau LOW (GPIO 12)
+    digitalWrite(LED_YELLOW, LOW);   // Kuning LOW (GPIO 14)
+    digitalWrite(LED_RED, HIGH);     // Merah HIGH (GPIO 13)
+    
+    digitalWrite(BUZZER_PIN, BUZZER_ON); // Buzzer On Berterusan (GPIO 25)
+
+    if (currentMillis - lastNotifTime >= 10000) {
+      if (Blynk.connected()) {
+        Blynk.logEvent("flood_alert", "AMARAN BAHAYA! Paras air melepasi 3.0 cm!");
+      }
+      lastNotifTime = currentMillis;
+    }
+  } 
+  // 2. ALERT: Paras Air 1.5 cm hingga 3.0 cm
+  else if (waterLevel >= 1.5 && waterLevel < 3.0) {
+    statusStr = "ALERT";
+    digitalWrite(LED_GREEN, LOW);    // Hijau LOW (GPIO 12)
+    digitalWrite(LED_YELLOW, HIGH);  // Kuning HIGH (GPIO 14) - Pegang / Tetap Nyala
+    digitalWrite(LED_RED, LOW);      // Merah LOW (GPIO 13)
+    
+    // Buzzer Berbunyi Berkala (Bip/Beep)
+    buzzerState = !buzzerState;
+    digitalWrite(BUZZER_PIN, buzzerState ? BUZZER_ON : BUZZER_OFF);
+  } 
+  // 3. SAFE: Paras Air < 1.5 cm
+  else {
+    statusStr = "SAFE";
+    digitalWrite(LED_GREEN, HIGH);   // Hijau HIGH (GPIO 12)
+    digitalWrite(LED_YELLOW, LOW);   // Kuning LOW (GPIO 14)
+    digitalWrite(LED_RED, LOW);      // Merah LOW (GPIO 13)
+    
+    buzzerState = false;
+    digitalWrite(BUZZER_PIN, BUZZER_OFF); // Buzzer Senyap
+  }
+
+  // --- Kemaskini LCD 16x2 (I2C: GPIO 21 & 22) ---
+  char line1[17], line2[17];
+  snprintf(line1, sizeof(line1), "Lvl:%3.1fcm St:%-3s", waterLevel, statusStr.substring(0, 3).c_str());
+  snprintf(line2, sizeof(line2), "%-4s Flow:%4.1f", isRaining ? "RAIN" : "DRY ", flowRate);
+
+  lcd.setCursor(0, 0); lcd.print(line1);
+  lcd.setCursor(0, 1); lcd.print(line2);
+}
+
+// =============================================================
+// 4. Penghantaran Data ke Blynk Cloud
+// =============================================================
+void sendToBlynk() {
+  if (Blynk.connected()) {
+    int safeVal = (statusStr == "SAFE") ? 1 : 0;
+    int alertVal = (statusStr == "ALERT") ? 1 : 0;
+    int emergencyVal = (statusStr == "EMERGENCY") ? 1 : 0;
+
+    Blynk.virtualWrite(V0, flowRate);
+    Blynk.virtualWrite(V1, safeVal);
+    Blynk.virtualWrite(V2, alertVal);
+    Blynk.virtualWrite(V3, emergencyVal);
+    Blynk.virtualWrite(V4, waterLevel);
+    Blynk.virtualWrite(V5, isRaining ? "HUJAN" : "TAK HUJAN");
+  }
+}
+
+// =============================================================
+// 5. Setup & Ujian Perkakasan
+// =============================================================
+void setup() {
+  Serial.begin(115200);
+  Wire.begin(21, 22);
+
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  pinMode(FLOW_PIN, INPUT_PULLUP);
+  pinMode(RAIN_PIN, INPUT);
+  
+  pinMode(LED_GREEN, OUTPUT);
+  pinMode(LED_YELLOW, OUTPUT);
+  pinMode(LED_RED, OUTPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+
+  // Self-Test Perkakasan apabila ESP32 dihidupkan
+  digitalWrite(LED_GREEN, HIGH);
+  digitalWrite(LED_YELLOW, HIGH);
+  digitalWrite(LED_RED, HIGH);
+  digitalWrite(BUZZER_PIN, BUZZER_ON);
+  delay(300);
+  
+  digitalWrite(LED_GREEN, HIGH);
+  digitalWrite(LED_YELLOW, LOW);
+  digitalWrite(LED_RED, LOW);
+  digitalWrite(BUZZER_PIN, BUZZER_OFF); 
+
+  attachInterrupt(digitalPinToInterrupt(FLOW_PIN), pulseCounter, FALLING);
+  oldTime = millis();
+
+  lcd.init();
+  lcd.backlight();
+  lcd.clear();
+  lcd.setCursor(0, 0); lcd.print("Flood System");
+  lcd.setCursor(0, 1); lcd.print("Connecting IoT..");
+  
+  WiFi.begin(ssid, pass);
+
+  int count = 0;
+  while (WiFi.status() != WL_CONNECTED && count < 10) {
+    delay(500);
+    count++;
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Blynk.config(BLYNK_AUTH_TOKEN);
+    Blynk.connect(2000);
+  }
+
+  timer.setInterval(500L, processSensorData); 
+  timer.setInterval(5000L, sendToBlynk);       
+
+  lcd.clear();
+}
+
+// =============================================================
+// 6. Main Loop
+// =============================================================
+void loop() {
+  if (WiFi.status() == WL_CONNECTED) {
+    if (!Blynk.connected()) {
+      Blynk.connect();
+    } else {
+      Blynk.run();
+    }
+  }
+  timer.run();
+}
